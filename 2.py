@@ -128,6 +128,7 @@ class MutualLearningModel(nn.Module):
 # 2. ESM 特征提取器
 # ==========================================
 class ESMFeatureExtractor:
+    """改进的ESM特征提取器，使用ESM-2 35M模型，支持GPU异常后切换到CPU继续提取"""
     def __init__(self):
         self.gpu_model = None
         self.gpu_batch_converter = None
@@ -137,71 +138,163 @@ class ESMFeatureExtractor:
         self._initialize_models()
         
     def _initialize_models(self):
+        """初始化GPU和CPU模型（使用35M版本）"""
         try:
+            # 先尝试加载GPU模型
             if torch.cuda.is_available():
-                print("🚀 尝试加载GPU模型（ESM-2 650M）...")
-                self.gpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+                print("🚀 尝试加载GPU模型（ESM-2 35M）...")
+                # 使用35M参数模型 (12 layers)
+                self.gpu_model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
                 self.gpu_device = torch.device('cuda')
                 self.gpu_model = self.gpu_model.to(self.gpu_device)
                 self.gpu_batch_converter = alphabet.get_batch_converter()
                 self.device = self.gpu_device
-                print("✅ GPU模型加载成功")
+                print("✅ GPU模型（ESM-2 35M）加载成功")
+            else:
+                print("ℹ️ CUDA不可用，直接使用CPU")
         except Exception as e:
             print(f"❌ GPU模型加载失败: {e}")
         
+        # 总是加载CPU模型作为备用
         try:
-            print("🖥️ 加载CPU模型作为备用...")
-            self.cpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            print("🖥️ 加载CPU模型（ESM-2 35M）作为备用...")
+            self.cpu_model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
             self.cpu_device = torch.device('cpu')
             self.cpu_model = self.cpu_model.to(self.cpu_device)
             self.cpu_batch_converter = alphabet.get_batch_converter()
-            if self.device is None: self.device = self.cpu_device
-            print("✅ CPU模型加载成功")
+            if self.device is None:
+                self.device = self.cpu_device
+            print("✅ CPU模型（ESM-2 35M）加载成功")
         except Exception as e:
             print(f"❌ CPU模型加载失败: {e}")
             raise
 
     def _extract_batch_features(self, batch_data, use_gpu=True):
+        """提取单个批次的特征"""
         try:
-            model = self.gpu_model if use_gpu and self.gpu_model else self.cpu_model
-            batch_converter = self.gpu_batch_converter if use_gpu and self.gpu_model else self.cpu_batch_converter
-            device = self.gpu_device if use_gpu and self.gpu_model else self.cpu_device
+            if use_gpu and self.gpu_model is not None:
+                model = self.gpu_model
+                batch_converter = self.gpu_batch_converter
+                device = self.gpu_device
+            else:
+                model = self.cpu_model
+                batch_converter = self.cpu_batch_converter
+                device = self.cpu_device
                 
             _, _, batch_tokens = batch_converter(batch_data)
             batch_tokens = batch_tokens.to(device)
             
             with torch.no_grad():
-                results = model(batch_tokens, repr_layers=[33], return_contacts=False)
-                token_representations = results["representations"][33]
+                # 使用第12层（35M模型的最后一层）进行特征提取
+                results = model(batch_tokens, repr_layers=[12], return_contacts=False)
+                token_representations = results["representations"][12]
+                
+                # 平均池化（忽略填充token）
                 seq_lengths = (batch_tokens != model.alphabet.padding_idx).sum(1)
-                batch_features = [token_representations[i, :seq_lengths[i]].mean(0).cpu().numpy() 
-                                 for i in range(token_representations.size(0))]
+                batch_features = []
+                for seq_idx in range(token_representations.size(0)):
+                    seq_len = seq_lengths[seq_idx].item()
+                    seq_rep = token_representations[seq_idx, :seq_len]
+                    batch_features.append(seq_rep.mean(0).cpu().numpy())
             
-            del batch_tokens, results
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            # 清理内存
+            del batch_tokens, results, token_representations
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             return batch_features
+            
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e) and use_gpu:
-                return self._extract_batch_features(batch_data, use_gpu=False)
-            raise
+            if "CUDA out of memory" in str(e):
+                print(f"💥 GPU内存不足，尝试使用CPU...")
+                if use_gpu:
+                    return self._extract_batch_features(batch_data, use_gpu=False)
+                else:
+                    raise
+            else:
+                raise
 
     def extract_features(self, sequences, cache_path=None, batch_size=1):
-        if cache_path and os.path.exists(cache_path):
-            print(f"📂 从缓存加载特征: {cache_path}")
-            with open(cache_path, 'rb') as f: return pickle.load(f)
+        """智能特征提取：支持断点续传和故障转移"""
+        progress_file = None
+        if cache_path:
+            progress_file = cache_path.replace('.pkl', '_progress.pkl')
+            cache_dir = os.path.dirname(cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
         
+        if cache_path and os.path.exists(cache_path):
+            print(f"📂 从缓存加载完整特征: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        
+        start_idx = 0
         features = []
-        for i in range(0, len(sequences), batch_size):
-            batch = sequences[i:i+batch_size]
+        if progress_file and os.path.exists(progress_file):
+            print(f"🔄 检测到进度文件，尝试恢复特征提取...")
+            try:
+                with open(progress_file, 'rb') as f:
+                    progress_data = pickle.load(f)
+                features = progress_data['features']
+                start_idx = progress_data['last_index'] + 1
+                print(f"✅ 从第 {start_idx} 个序列恢复，已完成 {len(features)} 个特征")
+            except Exception as e:
+                print(f"❌ 加载进度文件失败: {e}")
+                start_idx = 0
+                features = []
+        
+        if start_idx >= len(sequences):
+            print("✅ 所有特征已提取完成")
+            return np.array(features)
+        
+        print(f"🔧 开始特征提取（使用ESM-2 35M模型）... (从 {start_idx}/{len(sequences)})")
+        
+        i = start_idx
+        use_gpu = (self.gpu_model is not None)
+        
+        while i < len(sequences):
+            batch_end = min(i + batch_size, len(sequences))
+            batch = sequences[i:batch_end]
             batch_data = [(str(idx), seq) for idx, seq in enumerate(batch)]
-            features.extend(self._extract_batch_features(batch_data))
-            if (i // batch_size) % 10 == 0: print(f"📊 进度: {min(i+batch_size, len(sequences))}/{len(sequences)}")
             
+            try:
+                batch_features = self._extract_batch_features(batch_data, use_gpu=use_gpu)
+                features.extend(batch_features)
+                
+                if progress_file:
+                    with open(progress_file, 'wb') as f:
+                        pickle.dump({'features': features, 'last_index': batch_end - 1}, f)
+                
+                if (i // batch_size) % 10 == 0:
+                    device_type = "GPU" if use_gpu and self.gpu_model is not None else "CPU"
+                    print(f"📊 {device_type}模式 - 已完成 {batch_end}/{len(sequences)}")
+                
+                i = batch_end
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e) and use_gpu:
+                    print("💥 GPU内存不足，切换到CPU模式继续提取...")
+                    use_gpu = False
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    print(f"❌ 处理批次 {i} 时出错: {e}")
+                    i = batch_end
+                    continue
+            except Exception as e:
+                print(f"❌ 处理批次 {i} 时未知错误: {e}")
+                i = batch_end
+                continue
+        
         features_array = np.array(features)
         if cache_path:
-            with open(cache_path, 'wb') as f: pickle.dump(features_array, f)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(features_array, f)
+            if progress_file and os.path.exists(progress_file):
+                os.remove(progress_file)
+        
+        print(f"✅ 特征提取完成！特征维度: {features_array.shape}")
         return features_array
-
 # ==========================================
 # 3. CSV处理专用函数
 # ==========================================

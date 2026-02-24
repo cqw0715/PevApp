@@ -12,7 +12,7 @@ from typing import List, Tuple, Optional, Union
 from tqdm import tqdm
 
 # ==========================================
-# 模型架构定义（与训练时保持一致）
+# 模型架构定义（修改为480维输入，适配ESM-2 35M）
 # ==========================================
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,7 +31,7 @@ except ImportError:
             return self.norm(x)
 
 class CNNBranch(nn.Module):
-    def __init__(self, input_dim=480, num_classes=2):
+    def __init__(self, input_dim=480, num_classes=2):  # ✅ 修改：input_dim=480
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -56,7 +56,7 @@ class CNNBranch(nn.Module):
         return self.classifier(feat)
 
 class TransformerBranch(nn.Module):
-    def __init__(self, input_dim=480, d_model=256, nhead=8, num_classes=2):
+    def __init__(self, input_dim=480, d_model=256, nhead=8, num_classes=2):  # ✅ 修改：input_dim=480
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=0.2)
@@ -87,7 +87,7 @@ class MambaBranch(nn.Module):
         return self.classifier(x)
 
 class MutualLearningModel(nn.Module):
-    def __init__(self, input_dim, num_classes=2, embed_dim=128):
+    def __init__(self, input_dim=480, num_classes=2, embed_dim=128):  # ✅ 修改：input_dim=480
         super().__init__()
         self.cnn = CNNBranch(input_dim, num_classes)
         self.trans = TransformerBranch(input_dim, num_classes=num_classes)
@@ -158,7 +158,7 @@ class MutualLearningModel(nn.Module):
         return o1, o2, o3, o_fused
 
 # ==========================================
-# 特征提取类（修复缓存问题）
+# 特征提取类（使用ESM-2 35M，输出480维特征）
 # ==========================================
 class ESMFeatureExtractor:
     """改进的ESM特征提取器，使用ESM-2 35M模型，支持GPU异常后切换到CPU继续提取"""
@@ -176,7 +176,7 @@ class ESMFeatureExtractor:
             # 先尝试加载GPU模型
             if torch.cuda.is_available():
                 print("🚀 尝试加载GPU模型（ESM-2 35M）...")
-                # 使用35M参数模型 (12 layers)
+                # 使用35M参数模型 (12 layers, 480维输出)
                 self.gpu_model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
                 self.gpu_device = torch.device('cuda')
                 self.gpu_model = self.gpu_model.to(self.gpu_device)
@@ -203,7 +203,7 @@ class ESMFeatureExtractor:
             raise
 
     def _extract_batch_features(self, batch_data, use_gpu=True):
-        """提取单个批次的特征"""
+        """提取单个批次的特征（输出480维）"""
         try:
             if use_gpu and self.gpu_model is not None:
                 model = self.gpu_model
@@ -218,7 +218,7 @@ class ESMFeatureExtractor:
             batch_tokens = batch_tokens.to(device)
             
             with torch.no_grad():
-                # 使用第12层（35M模型的最后一层）进行特征提取
+                # 使用第12层（35M模型的最后一层）进行特征提取，输出480维
                 results = model(batch_tokens, repr_layers=[12], return_contacts=False)
                 token_representations = results["representations"][12]
                 
@@ -248,7 +248,7 @@ class ESMFeatureExtractor:
                 raise
 
     def extract_features(self, sequences, cache_path=None, batch_size=1):
-        """智能特征提取：支持断点续传和故障转移"""
+        """智能特征提取：支持断点续传和故障转移（输出480维特征）"""
         progress_file = None
         if cache_path:
             progress_file = cache_path.replace('.pkl', '_progress.pkl')
@@ -280,7 +280,7 @@ class ESMFeatureExtractor:
             print("✅ 所有特征已提取完成")
             return np.array(features)
         
-        print(f"🔧 开始特征提取（使用ESM-2 35M模型）... (从 {start_idx}/{len(sequences)})")
+        print(f"🔧 开始特征提取（使用ESM-2 35M模型，输出480维特征）... (从 {start_idx}/{len(sequences)})")
         
         i = start_idx
         use_gpu = (self.gpu_model is not None)
@@ -326,7 +326,7 @@ class ESMFeatureExtractor:
             if progress_file and os.path.exists(progress_file):
                 os.remove(progress_file)
         
-        print(f"✅ 特征提取完成！特征维度: {features_array.shape}")
+        print(f"✅ 特征提取完成！特征维度: {features_array.shape} (应为[样本数, 480])")
         return features_array
 
 # ==========================================
@@ -334,36 +334,42 @@ class ESMFeatureExtractor:
 # ==========================================
 @st.cache_resource
 def get_feature_extractor():
-    """获取特征提取器的缓存实例"""
+    """获取特征提取器的缓存实例（ESM-2 35M）"""
     return ESMFeatureExtractor()
 
 @st.cache_resource
 def load_model_and_scaler():
-    """加载预训练模型和标准化器"""
-    with st.spinner("🔄 正在加载预训练模型..."):
+    """加载预训练模型和标准化器（适配480维输入）"""
+    with st.spinner("🔄 正在加载预训练模型（480维输入）..."):
         # 检查模型文件是否存在
         model_path = "best_mutual_learning_model.pth"
         if not os.path.exists(model_path):
             st.error(f"❌ 模型文件未找到: {model_path}")
-            st.info("请确保模型文件与应用在同一目录下")
+            st.info("请确保模型文件与应用在同一目录下，且是使用480维特征训练的模型")
             return None, None, None
         
-        # 加载模型 - 修复安全警告
+        # 加载模型
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         try:
-            # 尝试使用 weights_only=True (PyTorch 2.1+)
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         except TypeError:
-            # 旧版本PyTorch不支持weights_only参数
             checkpoint = torch.load(model_path, map_location=device)
         
-        # 初始化模型
-        model = MutualLearningModel(input_dim=480, num_classes=2).to(device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # 初始化480维输入的模型
+        model = MutualLearningModel(input_dim=480, num_classes=2).to(device)  # ✅ 关键修改：input_dim=480
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as e:
+            st.error(f"❌ 模型权重加载失败: {e}")
+            st.error("请确认模型文件是使用480维输入训练的！")
+            return None, None, None
         model.eval()
         
-        # 获取标准化器
+        # 获取标准化器（应为480维）
         scaler = checkpoint['scaler']
+        if hasattr(scaler, 'n_features_in_') and scaler.n_features_in_ != 480:
+            st.warning(f"⚠️ 警告：标准化器期望 {scaler.n_features_in_} 维输入，但当前使用480维特征！")
+            st.warning("请确保使用与训练时相同维度的特征和标准化器")
         
         return model, scaler, device
 
@@ -386,10 +392,11 @@ def main():
         <h3>🔬 系统说明</h3>
         <p>本系统使用深度学习模型对蛋白质序列进行分类，判断其是否为猪肠道病毒。</p>
         <ul>
-            <li><b>类别0</b>: 猪肠道病毒</li>
-            <li><b>类别1</b>: 非猪肠道病毒</li>
+            <li><b>类别0</b>: 猪肠道病毒 (PEV)</li>
+            <li><b>类别1</b>: 非猪肠道病毒 (non-PEV)</li>
         </ul>
-        <p>模型基于ESM-2 650M特征提取器和多分支融合架构，提供高精度的预测结果。</p>
+        <p>模型基于<strong>ESM-2 35M</strong>特征提取器（输出480维特征）和多分支融合架构，提供高精度的预测结果。</p>
+        <p style="color: #e74c3c; font-weight: bold;">⚠️ 重要：请确保模型文件是使用480维特征训练的！</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -397,7 +404,7 @@ def main():
     with st.sidebar:
         st.header("⚙️ 系统设置")
         st.markdown("### 模型信息")
-        st.info("深度学习融合模型\n(ESM-2 + CNN + Transformer + Mamba)")
+        st.info("深度学习融合模型\n(ESM-2 35M + CNN + Transformer + Mamba)\n<strong>输入维度: 480</strong>")
         
         st.markdown("### 使用说明")
         st.markdown("""
@@ -408,9 +415,10 @@ def main():
         
         st.markdown("### 注意事项")
         st.warning("""
-        - 仅支持标准氨基酸字符
+        - 仅支持标准氨基酸字符 (ACDEFGHIKLMNPQRSTVWY)
         - 序列长度建议在50-2000个氨基酸之间
         - GPU加速可显著提升处理速度
+        - <strong>必须使用480维训练的模型文件</strong>
         """)
     
     # 加载模型和特征提取器
@@ -426,9 +434,14 @@ def main():
         if not sequences:
             return []
         
-        # 提取特征
-        with st.spinner(f"🧬 正在提取 {len(sequences)} 条序列的特征..."):
+        # 提取特征（480维）
+        with st.spinner(f"🧬 正在提取 {len(sequences)} 条序列的特征（ESM-2 35M，480维）..."):
             features = feature_extractor.extract_features(sequences)
+        
+        # 验证特征维度
+        if features.shape[1] != 480:
+            st.error(f"❌ 特征维度错误！期望480维，但得到{features.shape[1]}维")
+            st.stop()
         
         # 标准化
         features_scaled = scaler.transform(features)
@@ -462,9 +475,9 @@ def main():
     if input_option == "单序列预测":
         st.subheader("🔤 输入蛋白质序列")
         sequence_input = st.text_area(
-            "粘贴蛋白质序列 (仅支持标准氨基酸字符)",
+            "粘贴蛋白质序列 (仅支持标准氨基酸字符 ACDEFGHIKLMNPQRSTVWY)",
             height=150,
-            placeholder="例如: MAFSAEDVLKEYDRRRRMEALLLSLYYPNDRKLLDYKEWSPPRVQVECPKAPVEWNNPPSEKGLIVGHFSGIKYKGEKAQASEVDVNKMCCWVSKFKDAMRRYQGIQTCKIPGKVLSDLDMKHLKKADLIICAPNSYKKDDKPNQIKLLAVPTVMTKDDKQLLQEINELQDVVQDLRSLVEKNQIPAVDRAVTLTQRGELQAAGDKTLQEAVDRLQDKLQSLAEEGVKALQEELRKQLEAVDRAVTKLEQKLQDQVEALQARVDSLQAELRALQAQLAELQAELQALRSQLDELQAQLAELQAQLQELQAQLSELQSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQ"
+            placeholder="例如: MAFSAEDVLKEYDRRRRMEALLLSLYYPNDRKLLDYKEWSPPRVQVECPKAPVEWNNPPSEKGLIVGHFSGIKYKGEKAQASEVDVNKMCCWVSKFKDAMRRYQGIQTCKIPGKVLSDLDMKHLKKADLIICAPNSYKKDDKPNQIKLLAVPTVMTKDDKQLLQEINELQDVVQDLRSLVEKNQIPAVDRAVTLTQRGELQAAGDKTLQEAVDRLQDKLQSLAEEGVKALQEELRKQLEAVDRAVTKLEQKLQDQVEALQARVDSLQAELRALQAQLAELQAELQALRSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQ"
         )
         
         if st.button("🔍 开始预测", type="primary"):
@@ -500,6 +513,7 @@ def main():
                         <h3 style="color: {color};">{emoji} 预测结果: {result['class_name']}</h3>
                         <p><b>置信度:</b> {result['confidence']:.2%}</p>
                         <p><b>序列预览:</b> {result['sequence']}</p>
+                        <p><small>💡 系统使用ESM-2 35M模型提取480维特征进行预测</small></p>
                     </div>
                     """, unsafe_allow_html=True)
                     
@@ -521,7 +535,7 @@ def main():
                     
                     bars = ax.barh(classes, probabilities, color=colors)
                     ax.set_xlim(0, 1)
-                    ax.set_title('Forecast probability distribution')
+                    ax.set_title('预测概率分布')
                     ax.bar_label(bars, fmt='%.2f', padding=3)
                     
                     st.pyplot(fig)
@@ -577,7 +591,7 @@ def main():
                             st.warning("⚠️ 没有有效的序列可以预测")
                         else:
                             # 进行预测
-                            with st.spinner(f"🧠 正在预测 {len(sequences)} 条序列..."):
+                            with st.spinner(f"🧠 正在预测 {len(sequences)} 条序列（使用480维特征）..."):
                                 start_time = time.time()
                                 results = predict_sequences(sequences)
                                 elapsed_time = time.time() - start_time
@@ -615,7 +629,7 @@ def main():
                                 non_pig_count = total_valid - pig_virus_count
                                 st.metric("非猪肠道病毒", non_pig_count)
                             
-                            st.success(f"✅ 预测完成! 耗时: {elapsed_time:.2f} 秒")
+                            st.success(f"✅ 预测完成! 耗时: {elapsed_time:.2f} 秒 | 特征维度: 480")
                             
                             # 显示结果预览
                             st.subheader("🔍 结果预览")
@@ -636,7 +650,8 @@ def main():
                             import matplotlib.pyplot as plt
                             
                             fig, ax = plt.subplots(figsize=(10, 6))
-                            class_counts = output_df[output_df['Prediction'] != "无效序列"]['Class'].value_counts()
+                            valid_results = output_df[output_df['Prediction'] != "无效序列"]
+                            class_counts = valid_results['Class'].value_counts()
                             colors = ['#ff4b4b', '#1f77b4']
                             
                             bars = class_counts.plot(kind='bar', color=colors, ax=ax)

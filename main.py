@@ -73,6 +73,6 @@ run_model(tab2, "2.py", "model_multiclass")
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; padding: 10px;">
-    <p>病毒预测系统整合平台 &copy; 2024 | 本平台仅调用原始模型，不修改其功能</p>
+    <p>病毒预测系统整合平台 &copy; 2026 | 本平台仅调用原始模型，不修改其功能</p>
 </div>
 """, unsafe_allow_html=True)

@@ -31,7 +31,7 @@ except ImportError:
             return self.norm(x)
 
 class CNNBranch(nn.Module):
-    def __init__(self, input_dim=1280, num_classes=2):
+    def __init__(self, input_dim=480, num_classes=2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -56,7 +56,7 @@ class CNNBranch(nn.Module):
         return self.classifier(feat)
 
 class TransformerBranch(nn.Module):
-    def __init__(self, input_dim=1280, d_model=256, nhead=8, num_classes=2):
+    def __init__(self, input_dim=480, d_model=256, nhead=8, num_classes=2):
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=0.2)
@@ -358,7 +358,7 @@ def load_model_and_scaler():
             checkpoint = torch.load(model_path, map_location=device)
         
         # 初始化模型
-        model = MutualLearningModel(input_dim=1280, num_classes=2).to(device)
+        model = MutualLearningModel(input_dim=480, num_classes=2).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         

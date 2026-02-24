@@ -323,7 +323,7 @@ def load_model_and_scaler():
 # ==========================================
 def predict(model, scaler, sequences, device, virus_map):
     """进行预测"""
-    extractor = ESMFeatureExtractor()
+    extractor = esm_predict()
     st.info("🧬 正在提取ESM-2特征，请稍候...")
     features = extractor.extract_features(sequences)
     

@@ -187,7 +187,7 @@ if st.button("用ESM-650M预测"):
 @st.cache_resource
 def get_feature_extractor():
     """获取特征提取器的缓存实例"""
-    return ESMFeatureExtractor()
+    return esm_predict()
 
 @st.cache_resource
 def load_model_and_scaler():

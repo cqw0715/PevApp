@@ -10,6 +10,9 @@ import esm
 import time
 from typing import List, Tuple, Optional, Union
 from tqdm import tqdm
+import requests
+import json
+import matplotlib.pyplot as plt
 
 # ==========================================
 # 模型架构定义（与训练时保持一致）
@@ -158,13 +161,11 @@ class MutualLearningModel(nn.Module):
         return o1, o2, o3, o_fused
 
 # ==========================================
-# 特征提取类（修复缓存问题）
+# ESM特征提取（带缓存优化）
 # ==========================================
-# main.py 中替换模型加载部分
-import requests, json
-
-def esm_predict(sequence: str):
-    """调用ESM Atlas官方API（免费，无需下载模型）"""
+@st.cache_data(show_spinner=False)
+def get_esm_embedding(sequence: str) -> np.ndarray:
+    """获取单条序列的ESM嵌入向量（带缓存）"""
     try:
         response = requests.post(
             "https://api.esmatlas.com/v1/embed",
@@ -172,23 +173,26 @@ def esm_predict(sequence: str):
             timeout=30
         )
         response.raise_for_status()
-        return response.json()["embedding"]  # 返回650M模型生成的嵌入向量
+        embedding = response.json().get("embedding")
+        if embedding is None:
+            st.error(f"API返回无嵌入数据: {response.text}")
+            return np.zeros(1280)
+        return np.array(embedding, dtype=np.float32)
     except Exception as e:
-        return f"API错误: {str(e)}"
+        st.error(f"ESM API请求失败: {str(e)}")
+        return np.zeros(1280)
 
-# Streamlit界面
-if st.button("用ESM-650M预测"):
-    result = esm_predict(user_sequence)
-    st.success("✅ 通过官方API完成预测（无需本地模型）")
+def extract_features(sequences: List[str]) -> np.ndarray:
+    """批量提取ESM特征（内部自动缓存）"""
+    features = []
+    for seq in sequences:
+        feat = get_esm_embedding(seq)
+        features.append(feat)
+    return np.array(features)
 
 # ==========================================
 # 缓存函数 - 正确使用st.cache_resource
 # ==========================================
-@st.cache_resource
-def get_feature_extractor():
-    """获取特征提取器的缓存实例"""
-    return esm_predict()
-
 @st.cache_resource
 def load_model_and_scaler():
     """加载预训练模型和标准化器"""
@@ -260,27 +264,27 @@ def main():
         
         st.markdown("### 注意事项")
         st.warning("""
-        - 仅支持标准氨基酸字符
-        - 序列长度建议在50-2000个氨基酸之间
-        - GPU加速可显著提升处理速度
+        - 仅支持标准氨基酸字符 (ACDEFGHIKLMNPQRSTVWY)
+        - 序列长度建议在10-5000个氨基酸之间
+        - 网络需能访问 https://api.esmatlas.com
+        - 相同序列的特征会自动缓存，避免重复请求
         """)
     
-    # 加载模型和特征提取器
+    # 加载模型（不再加载feature_extractor）
     model, scaler, device = load_model_and_scaler()
-    feature_extractor = get_feature_extractor()
     
-    if model is None or feature_extractor is None:
+    if model is None:
         st.stop()
     
-    # 预测函数
+    # 预测函数（已修复特征提取逻辑）
     def predict_sequences(sequences: List[str]) -> List[dict]:
         """对序列列表进行预测"""
         if not sequences:
             return []
         
-        # 提取特征
+        # 提取特征（使用带缓存的函数）
         with st.spinner(f"🧬 正在提取 {len(sequences)} 条序列的特征..."):
-            features = feature_extractor.extract_features(sequences)
+            features = extract_features(sequences)
         
         # 标准化
         features_scaled = scaler.transform(features)
@@ -316,7 +320,7 @@ def main():
         sequence_input = st.text_area(
             "粘贴蛋白质序列 (仅支持标准氨基酸字符)",
             height=150,
-            placeholder="例如: MAFSAEDVLKEYDRRRRMEALLLSLYYPNDRKLLDYKEWSPPRVQVECPKAPVEWNNPPSEKGLIVGHFSGIKYKGEKAQASEVDVNKMCCWVSKFKDAMRRYQGIQTCKIPGKVLSDLDMKHLKKADLIICAPNSYKKDDKPNQIKLLAVPTVMTKDDKQLLQEINELQDVVQDLRSLVEKNQIPAVDRAVTLTQRGELQAAGDKTLQEAVDRLQDKLQSLAEEGVKALQEELRKQLEAVDRAVTKLEQKLQDQVEALQARVDSLQAELRALQAQLAELQAELQALRSQLDELQAQLAELQAQLQELQAQLSELQSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQ"
+            placeholder="例如: MAFSAEDVLKEYDRRRRMEALLLSLYYPNDRKLLDYKEWSPPRVQVECPKAPVEWNNPPSEKGLIVGHFSGIKYKGEKAQASEVDVNKMCCWVSKFKDAMRRYQGIQTCKIPGKVLSDLDMKHLKKADLIICAPNSYKKDDKPNQIKLLAVPTVMTKDDKQLLQEINELQDVVQDLRSLVEKNQIPAVDRAVTLTQRGELQAAGDKTLQEAVDRLQDKLQSLAEEGVKALQEELRKQLEAVDRAVTKLEQKLQDQVEALQARVDSLQAELRALQAQLAELQAELQALRSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQALQSELQAQLSQLDELQAQLAELQAQLQ"
         )
         
         if st.button("🔍 开始预测", type="primary"):
@@ -364,8 +368,6 @@ def main():
                         st.metric("非猪肠道病毒概率", f"{result['confidence']:.2%}")
                     
                     # 可视化置信度
-                    import matplotlib.pyplot as plt
-                    
                     fig, ax = plt.subplots(figsize=(8, 2))
                     classes = ['PEV', 'non-PEV']
                     probabilities = [1-result['confidence'], result['confidence']]
@@ -377,6 +379,7 @@ def main():
                     ax.bar_label(bars, fmt='%.2f', padding=3)
                     
                     st.pyplot(fig)
+                    plt.close(fig)
                     
                     # 显示完整序列
                     with st.expander("📋 查看完整序列"):
@@ -485,8 +488,6 @@ def main():
                             
                             # 可视化
                             st.subheader("📈 结果分布")
-                            import matplotlib.pyplot as plt
-                            
                             fig, ax = plt.subplots(figsize=(10, 6))
                             class_counts = output_df[output_df['Prediction'] != "无效序列"]['Class'].value_counts()
                             colors = ['#ff4b4b', '#1f77b4']
@@ -502,6 +503,7 @@ def main():
                                 ax.text(i, v + 0.5, str(v), ha='center', fontweight='bold')
                             
                             st.pyplot(fig)
+                            plt.close(fig)
                             
             except Exception as e:
                 st.error(f"❌ 处理文件时出错: {str(e)}")

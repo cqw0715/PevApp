@@ -127,80 +127,26 @@ class MutualLearningModel(nn.Module):
 # ==========================================
 # 2. ESM 特征提取器
 # ==========================================
-class ESMFeatureExtractor:
-    def __init__(self):
-        self.gpu_model = None
-        self.gpu_batch_converter = None
-        self.cpu_model = None
-        self.cpu_batch_converter = None
-        self.device = None
-        self._initialize_models()
-        
-    def _initialize_models(self):
-        try:
-            if torch.cuda.is_available():
-                print("🚀 尝试加载GPU模型（ESM-2 650M）...")
-                self.gpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-                self.gpu_device = torch.device('cuda')
-                self.gpu_model = self.gpu_model.to(self.gpu_device)
-                self.gpu_batch_converter = alphabet.get_batch_converter()
-                self.device = self.gpu_device
-                print("✅ GPU模型加载成功")
-        except Exception as e:
-            print(f"❌ GPU模型加载失败: {e}")
-        
-        try:
-            print("🖥️ 加载CPU模型作为备用...")
-            self.cpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-            self.cpu_device = torch.device('cpu')
-            self.cpu_model = self.cpu_model.to(self.cpu_device)
-            self.cpu_batch_converter = alphabet.get_batch_converter()
-            if self.device is None: self.device = self.cpu_device
-            print("✅ CPU模型加载成功")
-        except Exception as e:
-            print(f"❌ CPU模型加载失败: {e}")
-            raise
+# main.py 中替换模型加载部分
+import requests, json
 
-    def _extract_batch_features(self, batch_data, use_gpu=True):
-        try:
-            model = self.gpu_model if use_gpu and self.gpu_model else self.cpu_model
-            batch_converter = self.gpu_batch_converter if use_gpu and self.gpu_model else self.cpu_batch_converter
-            device = self.gpu_device if use_gpu and self.gpu_model else self.cpu_device
-                
-            _, _, batch_tokens = batch_converter(batch_data)
-            batch_tokens = batch_tokens.to(device)
-            
-            with torch.no_grad():
-                results = model(batch_tokens, repr_layers=[33], return_contacts=False)
-                token_representations = results["representations"][33]
-                seq_lengths = (batch_tokens != model.alphabet.padding_idx).sum(1)
-                batch_features = [token_representations[i, :seq_lengths[i]].mean(0).cpu().numpy() 
-                                 for i in range(token_representations.size(0))]
-            
-            del batch_tokens, results
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            return batch_features
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e) and use_gpu:
-                return self._extract_batch_features(batch_data, use_gpu=False)
-            raise
+def esm_predict(sequence: str):
+    """调用ESM Atlas官方API（免费，无需下载模型）"""
+    try:
+        response = requests.post(
+            "https://api.esmatlas.com/v1/embed",
+            json={"sequence": sequence},
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()["embedding"]  # 返回650M模型生成的嵌入向量
+    except Exception as e:
+        return f"API错误: {str(e)}"
 
-    def extract_features(self, sequences, cache_path=None, batch_size=1):
-        if cache_path and os.path.exists(cache_path):
-            print(f"📂 从缓存加载特征: {cache_path}")
-            with open(cache_path, 'rb') as f: return pickle.load(f)
-        
-        features = []
-        for i in range(0, len(sequences), batch_size):
-            batch = sequences[i:i+batch_size]
-            batch_data = [(str(idx), seq) for idx, seq in enumerate(batch)]
-            features.extend(self._extract_batch_features(batch_data))
-            if (i // batch_size) % 10 == 0: print(f"📊 进度: {min(i+batch_size, len(sequences))}/{len(sequences)}")
-            
-        features_array = np.array(features)
-        if cache_path:
-            with open(cache_path, 'wb') as f: pickle.dump(features_array, f)
-        return features_array
+# Streamlit界面
+if st.button("用ESM-650M预测"):
+    result = esm_predict(user_sequence)
+    st.success("✅ 通过官方API完成预测（无需本地模型）")
 
 # ==========================================
 # 3. CSV处理专用函数

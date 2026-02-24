@@ -11,13 +11,14 @@ from sklearn.preprocessing import StandardScaler
 import time
 import matplotlib.pyplot as plt
 import warnings
+import pickle  # 必需：用于缓存功能
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. 核心模型架构 (与训练代码完全一致)
+# 1. 核心模型架构 (修改为480维输入，适配ESM-2 35M)
 # ==========================================
 class CNNBranch(nn.Module):
-    def __init__(self, input_dim=1280, num_classes=8):
+    def __init__(self, input_dim=480, num_classes=8):  # ✅ 关键修改：input_dim=480
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -41,7 +42,7 @@ class CNNBranch(nn.Module):
         return self.classifier(self.net(x).flatten(1))
 
 class TransformerBranch(nn.Module):
-    def __init__(self, input_dim=1280, d_model=256, nhead=8, num_classes=8):
+    def __init__(self, input_dim=480, d_model=256, nhead=8, num_classes=8):  # ✅ 关键修改：input_dim=480
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=0.2)
@@ -53,7 +54,7 @@ class TransformerBranch(nn.Module):
         return self.classifier(self.transformer(x).squeeze(1))
 
 class MambaBranch(nn.Module):
-    def __init__(self, input_dim, num_classes=8):
+    def __init__(self, input_dim=480, num_classes=8):  # ✅ 关键修改：input_dim=480
         super().__init__()
         self.preprocess = nn.Linear(input_dim, 256)
         self.mamba_blocks = nn.ModuleList([Mamba(d_model=256, d_state=16, d_conv=4, expand=2) for _ in range(5)])
@@ -67,7 +68,7 @@ class MambaBranch(nn.Module):
         return self.classifier(self.norm(x).squeeze(1))
 
 class MutualLearningModel(nn.Module):
-    def __init__(self, input_dim, num_classes=8, embed_dim=128):
+    def __init__(self, input_dim=480, num_classes=8, embed_dim=128):  # ✅ 关键修改：input_dim=480
         super().__init__()
         self.cnn = CNNBranch(input_dim, num_classes)
         self.trans = TransformerBranch(input_dim, num_classes=num_classes)
@@ -125,9 +126,10 @@ class MutualLearningModel(nn.Module):
         return o1, o2, o3, o_fused + self.refine(o_fused)
 
 # ==========================================
-# 2. ESM 特征提取器
+# 2. ESM 特征提取器 (使用ESM-2 35M，输出480维特征)
 # ==========================================
 class ESMFeatureExtractor:
+    """改进的ESM特征提取器，使用ESM-2 35M模型，支持GPU异常后切换到CPU继续提取"""
     def __init__(self):
         self.gpu_model = None
         self.gpu_batch_converter = None
@@ -137,73 +139,166 @@ class ESMFeatureExtractor:
         self._initialize_models()
         
     def _initialize_models(self):
+        """初始化GPU和CPU模型（使用35M版本）"""
         try:
+            # 先尝试加载GPU模型
             if torch.cuda.is_available():
-                print("🚀 尝试加载GPU模型（ESM-2 650M）...")
-                self.gpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+                print("🚀 尝试加载GPU模型（ESM-2 35M）...")
+                # 使用35M参数模型 (12 layers, 480维输出)
+                self.gpu_model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
                 self.gpu_device = torch.device('cuda')
                 self.gpu_model = self.gpu_model.to(self.gpu_device)
                 self.gpu_batch_converter = alphabet.get_batch_converter()
                 self.device = self.gpu_device
-                print("✅ GPU模型加载成功")
+                print("✅ GPU模型（ESM-2 35M）加载成功")
+            else:
+                print("ℹ️ CUDA不可用，直接使用CPU")
         except Exception as e:
             print(f"❌ GPU模型加载失败: {e}")
         
+        # 总是加载CPU模型作为备用
         try:
-            print("🖥️ 加载CPU模型作为备用...")
-            self.cpu_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            print("🖥️ 加载CPU模型（ESM-2 35M）作为备用...")
+            self.cpu_model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
             self.cpu_device = torch.device('cpu')
             self.cpu_model = self.cpu_model.to(self.cpu_device)
             self.cpu_batch_converter = alphabet.get_batch_converter()
-            if self.device is None: self.device = self.cpu_device
-            print("✅ CPU模型加载成功")
+            if self.device is None:
+                self.device = self.cpu_device
+            print("✅ CPU模型（ESM-2 35M）加载成功")
         except Exception as e:
             print(f"❌ CPU模型加载失败: {e}")
             raise
 
     def _extract_batch_features(self, batch_data, use_gpu=True):
+        """提取单个批次的特征（输出480维）"""
         try:
-            model = self.gpu_model if use_gpu and self.gpu_model else self.cpu_model
-            batch_converter = self.gpu_batch_converter if use_gpu and self.gpu_model else self.cpu_batch_converter
-            device = self.gpu_device if use_gpu and self.gpu_model else self.cpu_device
+            if use_gpu and self.gpu_model is not None:
+                model = self.gpu_model
+                batch_converter = self.gpu_batch_converter
+                device = self.gpu_device
+            else:
+                model = self.cpu_model
+                batch_converter = self.cpu_batch_converter
+                device = self.cpu_device
                 
             _, _, batch_tokens = batch_converter(batch_data)
             batch_tokens = batch_tokens.to(device)
             
             with torch.no_grad():
-                results = model(batch_tokens, repr_layers=[33], return_contacts=False)
-                token_representations = results["representations"][33]
+                # 使用第12层（35M模型的最后一层）进行特征提取，输出480维
+                results = model(batch_tokens, repr_layers=[12], return_contacts=False)
+                token_representations = results["representations"][12]
+                
+                # 平均池化（忽略填充token）
                 seq_lengths = (batch_tokens != model.alphabet.padding_idx).sum(1)
-                batch_features = [token_representations[i, :seq_lengths[i]].mean(0).cpu().numpy() 
-                                 for i in range(token_representations.size(0))]
+                batch_features = []
+                for seq_idx in range(token_representations.size(0)):
+                    seq_len = seq_lengths[seq_idx].item()
+                    seq_rep = token_representations[seq_idx, :seq_len]
+                    batch_features.append(seq_rep.mean(0).cpu().numpy())
             
-            del batch_tokens, results
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            # 清理内存
+            del batch_tokens, results, token_representations
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             return batch_features
+            
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e) and use_gpu:
-                return self._extract_batch_features(batch_data, use_gpu=False)
-            raise
+            if "CUDA out of memory" in str(e):
+                print(f"💥 GPU内存不足，尝试使用CPU...")
+                if use_gpu:
+                    return self._extract_batch_features(batch_data, use_gpu=False)
+                else:
+                    raise
+            else:
+                raise
 
     def extract_features(self, sequences, cache_path=None, batch_size=1):
-        if cache_path and os.path.exists(cache_path):
-            print(f"📂 从缓存加载特征: {cache_path}")
-            with open(cache_path, 'rb') as f: return pickle.load(f)
+        """智能特征提取：支持断点续传和故障转移（输出480维特征）"""
+        progress_file = None
+        if cache_path:
+            progress_file = cache_path.replace('.pkl', '_progress.pkl')
+            cache_dir = os.path.dirname(cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
         
+        if cache_path and os.path.exists(cache_path):
+            print(f"📂 从缓存加载完整特征: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        
+        start_idx = 0
         features = []
-        for i in range(0, len(sequences), batch_size):
-            batch = sequences[i:i+batch_size]
+        if progress_file and os.path.exists(progress_file):
+            print(f"🔄 检测到进度文件，尝试恢复特征提取...")
+            try:
+                with open(progress_file, 'rb') as f:
+                    progress_data = pickle.load(f)
+                features = progress_data['features']
+                start_idx = progress_data['last_index'] + 1
+                print(f"✅ 从第 {start_idx} 个序列恢复，已完成 {len(features)} 个特征")
+            except Exception as e:
+                print(f"❌ 加载进度文件失败: {e}")
+                start_idx = 0
+                features = []
+        
+        if start_idx >= len(sequences):
+            print("✅ 所有特征已提取完成")
+            return np.array(features)
+        
+        print(f"🔧 开始特征提取（使用ESM-2 35M模型，输出480维特征）... (从 {start_idx}/{len(sequences)})")
+        
+        i = start_idx
+        use_gpu = (self.gpu_model is not None)
+        
+        while i < len(sequences):
+            batch_end = min(i + batch_size, len(sequences))
+            batch = sequences[i:batch_end]
             batch_data = [(str(idx), seq) for idx, seq in enumerate(batch)]
-            features.extend(self._extract_batch_features(batch_data))
-            if (i // batch_size) % 10 == 0: print(f"📊 进度: {min(i+batch_size, len(sequences))}/{len(sequences)}")
             
+            try:
+                batch_features = self._extract_batch_features(batch_data, use_gpu=use_gpu)
+                features.extend(batch_features)
+                
+                if progress_file:
+                    with open(progress_file, 'wb') as f:
+                        pickle.dump({'features': features, 'last_index': batch_end - 1}, f)
+                
+                if (i // batch_size) % 10 == 0:
+                    device_type = "GPU" if use_gpu and self.gpu_model is not None else "CPU"
+                    print(f"📊 {device_type}模式 - 已完成 {batch_end}/{len(sequences)}")
+                
+                i = batch_end
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e) and use_gpu:
+                    print("💥 GPU内存不足，切换到CPU模式继续提取...")
+                    use_gpu = False
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    print(f"❌ 处理批次 {i} 时出错: {e}")
+                    i = batch_end
+                    continue
+            except Exception as e:
+                print(f"❌ 处理批次 {i} 时未知错误: {e}")
+                i = batch_end
+                continue
+        
         features_array = np.array(features)
         if cache_path:
-            with open(cache_path, 'wb') as f: pickle.dump(features_array, f)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(features_array, f)
+            if progress_file and os.path.exists(progress_file):
+                os.remove(progress_file)
+        
+        print(f"✅ 特征提取完成！特征维度: {features_array.shape} (应为[样本数, 480])")
         return features_array
 
 # ==========================================
-# 3. CSV处理专用函数
+# 3. CSV处理专用函数 (保持不变)
 # ==========================================
 def validate_sequence(seq):
     """验证蛋白质序列"""
@@ -311,11 +406,11 @@ def parse_csv_sequences(uploaded_file):
         return None, None, None, None, None
 
 # ==========================================
-# 4. 模型加载
+# 4. 模型加载 (关键修改：input_dim=480 + 模型文件名)
 # ==========================================
 @st.cache_resource
 def load_model_and_scaler():
-    """加载模型和标准化器，使用缓存提高性能"""
+    """加载模型和标准化器，使用缓存提高性能（适配480维输入）"""
     import numpy as np
     import numpy.core.multiarray
     import sklearn.preprocessing._data
@@ -337,9 +432,12 @@ def load_model_and_scaler():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     st.info(f"使用设备: {device}")
     
-    model_path = "best_multiclass_model.pth"
+    # ✅ 关键修改1：模型文件名改为480维专用模型
+    model_path = "best_multiclass_model_480.pth"
     if not os.path.exists(model_path):
-        st.error(f"模型文件 {model_path} 未找到！请确保文件在当前目录中。")
+        st.error(f"❌ 模型文件 {model_path} 未找到！")
+        st.error("⚠️ 请确保已提供使用ESM-2 35M (480维)特征训练的模型文件")
+        st.info("💡 模型文件应包含：model_state_dict, scaler, virus_map")
         st.stop()
     
     try:
@@ -364,22 +462,37 @@ def load_model_and_scaler():
     })
     st.info(f"病毒类别映射: {', '.join(virus_map.values())}")
     
-    model = MutualLearningModel(input_dim=1280, num_classes=8).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # ✅ 关键修改2：初始化480维输入的模型
+    model = MutualLearningModel(input_dim=480, num_classes=8).to(device)  # input_dim=480
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    except RuntimeError as e:
+        st.error(f"❌ 模型权重加载失败: {e}")
+        st.error("⚠️ 请确认模型文件是使用480维输入训练的！")
+        st.stop()
     model.eval()
     
     scaler = checkpoint['scaler']
+    # 验证scaler维度
+    if hasattr(scaler, 'n_features_in_') and scaler.n_features_in_ != 480:
+        st.warning(f"⚠️ 警告：标准化器期望 {scaler.n_features_in_} 维输入，但当前使用480维特征！")
+        st.warning("请确保使用与训练时相同维度的特征和标准化器")
     
     return model, scaler, virus_map, device
 
 # ==========================================
-# 5. 预测和可视化函数
+# 5. 预测和可视化函数 (保持不变，特征维度由提取器保证)
 # ==========================================
 def predict(model, scaler, sequences, device, virus_map):
     """进行预测"""
     extractor = ESMFeatureExtractor()
-    st.info("🧬 正在提取ESM-2特征，请稍候...")
+    st.info("🧬 正在提取ESM-2 35M特征（480维），请稍候...")
     features = extractor.extract_features(sequences)
+    
+    # 验证特征维度
+    if features.shape[1] != 480:
+        st.error(f"❌ 特征维度错误！期望480维，但得到{features.shape[1]}维")
+        st.stop()
     
     st.info("⚖️ 标准化特征...")
     scaled_features = scaler.transform(features)
@@ -431,7 +544,7 @@ def create_probability_chart(probs, virus_map, title="类别概率分布"):
     return fig
 
 # ==========================================
-# 6. Streamlit 应用主函数
+# 6. Streamlit 应用主函数 (保持不变)
 # ==========================================
 def main():
     st.set_page_config(
@@ -443,6 +556,7 @@ def main():
     st.title("🦠 病毒蛋白多分类预测系统")
     st.markdown("""
     该系统使用深度学习模型对病毒蛋白序列进行分类，支持8种病毒家族的识别。
+    **当前配置：ESM-2 35M特征提取器（480维） + 480维输入专用模型**
     请上传包含蛋白质序列的CSV文件或直接输入单条序列进行预测。
     """)
     
@@ -453,7 +567,7 @@ def main():
             st.error(f"加载模型时发生严重错误: {str(e)}")
             st.stop()
     
-    st.success("✅ 模型加载成功！")
+    st.success("✅ 模型加载成功！（输入维度：480）")
     
     tab1, tab2, tab3 = st.tabs(["🔬 单序列预测", "📁 批量预测 (CSV)", "ℹ️ 关于模型"])
     
@@ -488,7 +602,7 @@ def main():
                             res['predicted_class'],
                             delta=f"{res['confidence']:.1%} 置信度"
                         )
-                        st.caption(f"⏱️ 处理时间: {elapsed_time:.2f} 秒")
+                        st.caption(f"⏱️ 处理时间: {elapsed_time:.2f} 秒 | 特征维度: 480")
                     
                     with col2:
                         fig = create_probability_chart(
@@ -501,9 +615,8 @@ def main():
                     st.subheader("📊 详细概率")
                     prob_df = pd.DataFrame({
                         '病毒家族': [virus_map[i] for i in range(8)],
-                        '概率': res['probabilities']  # 保留为 float
+                        '概率': res['probabilities']
                     }).sort_values('概率', ascending=False).reset_index(drop=True)
-                    # 安全格式化：仅对数值列应用格式
                     st.dataframe(
                         prob_df.style.format({'概率': '{:.4f}'}),
                         use_container_width=True
@@ -558,39 +671,34 @@ def main():
                 if len(valid_indices) > 50:
                     st.warning(f"⚠️ 您上传了 {len(valid_indices)} 个序列，处理可能需要较长时间")
                 
-                with st.spinner(f"⏳ 正在预测 {len(valid_indices)} 个序列..."):
+                with st.spinner(f"⏳ 正在预测 {len(valid_indices)} 个序列（480维特征）..."):
                     start_time = time.time()
                     valid_seqs = [sequences[i] for i in valid_indices]
                     valid_names = [seq_names[i] for i in valid_indices]
                     results = predict(model, scaler, valid_seqs, device, virus_map)
                     total_time = time.time() - start_time
                 
-                # ====== 修复核心：保留数值类型，不在构建时转字符串 ======
                 results_data = []
                 for i, (name, res) in enumerate(zip(valid_names, results)):
                     row = {
                         '序列名称': name,
                         '预测病毒': res['predicted_class'],
-                        '置信度': res['confidence']  # 保留为 float
+                        '置信度': res['confidence']
                     }
-                    # 添加所有病毒家族概率（保留为 float）
                     for j in range(8):
-                        row[virus_map[j]] = res['probabilities'][j]  # 关键修复：不转字符串
+                        row[virus_map[j]] = res['probabilities'][j]
                     results_data.append(row)
                 
                 results_df = pd.DataFrame(results_data)
                 
                 st.subheader("📈 预测结果汇总")
-                st.caption(f"⏱️ 总耗时: {total_time:.2f} 秒 | 平均: {total_time/len(valid_indices):.2f} 秒/序列")
+                st.caption(f"⏱️ 总耗时: {total_time:.2f} 秒 | 平均: {total_time/len(valid_indices):.2f} 秒/序列 | 特征维度: 480")
                 
-                # ====== 安全格式化：显式构建格式化字典 ======
-                format_dict = {'置信度': '{:.2%}'}  # 置信度显示为百分比
-                # 为所有病毒家族列添加格式（排除非数值列）
+                format_dict = {'置信度': '{:.2%}'}
                 for col in results_df.columns:
                     if col not in ['序列名称', '预测病毒', '置信度']:
                         format_dict[col] = '{:.4f}'
                 
-                # 应用格式化（添加 na_rep 处理潜在缺失值）
                 styled_df = results_df.style.format(format_dict, na_rep='N/A')
                 st.dataframe(styled_df, use_container_width=True)
                 
@@ -634,12 +742,11 @@ def main():
                     )
                     st.pyplot(fig)
                 
-                # 下载保留原始数值（小数形式，便于后续分析）
                 csv = results_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 下载预测结果 (CSV)",
                     data=csv,
-                    file_name="virus_predictions.csv",
+                    file_name="virus_predictions_480dim.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
@@ -650,7 +757,7 @@ def main():
         ### 🧠 模型架构
         - **三分支融合架构**: CNN + Transformer + Mamba
         - **自适应门控融合**: 动态加权整合三个分支的预测
-        - **输入特征**: ESM-2 (650M) 提取的1280维蛋白质表示
+        - **输入特征**: ESM-2 35M (t12_35M_UR50D) 提取的**480维**蛋白质表示 ✅
         
         ### 🦠 支持的病毒家族 (8类)
         | 编号 | 病毒家族 | 常见代表 |
@@ -663,6 +770,12 @@ def main():
         | 5 | Polyomavirus | 多瘤病毒 |
         | 6 | Rotavirus | 轮状病毒 |
         | 7 | Coronavirus | 冠状病毒 |
+        
+        ### 🔑 关键修改说明
+        - **特征提取器**: 使用 `esm2_t12_35M_UR50D` (12层, 480维输出)
+        - **模型输入维度**: 所有分支输入维度统一修改为 **480**
+        - **模型文件**: 需使用 `best_multiclass_model_480.pth` (480维训练专用)
+        - **标准化器**: 必须与480维特征匹配
         
         ### 📊 CSV上传说明
         - **必需列**: 包含氨基酸序列的列（自动识别常见列名）
@@ -679,6 +792,10 @@ def main():
         ```bash
         pip install streamlit torch esm mamba-ssm pandas numpy scikit-learn matplotlib
         ```
+        
+        ### ⚠️ 重要提示
+        **必须使用480维特征训练的模型文件** (`best_multiclass_model_480.pth`)，  
+        1280维模型文件将导致维度不匹配错误！
         """)
 
 if __name__ == "__main__":
